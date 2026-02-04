@@ -16,21 +16,40 @@ static void hex_to_ip(const char *hex, char *ip) {
     }
 }
 
-// 状态映射
-static const char* get_status_str(const char *proto, int st) {
-    if (strcmp(proto, "UDP") == 0) return "NONE";
+// 状态映射（返回枚举）
+static ConnectionStatus get_status_enum(const char *proto, int st) {
+    if (strcmp(proto, "UDP") == 0) return CONN_STATUS_NONE;
     switch (st) {
-        case 0x01: return "ESTABLISHED";
-        case 0x02: return "SYN_SENT";
-        case 0x03: return "SYN_RECV";
-        case 0x04: return "FIN_WAIT1";
-        case 0x05: return "FIN_WAIT2";
-        case 0x06: return "TIME_WAIT";
-        case 0x07: return "CLOSE";
-        case 0x08: return "CLOSE_WAIT";
-        case 0x09: return "LAST_ACK";
-        case 0x0A: return "LISTEN";
-        case 0x0B: return "CLOSING";
+        case 0x01: return CONN_STATUS_ESTABLISHED;
+        case 0x02: return CONN_STATUS_SYN_SENT;
+        case 0x03: return CONN_STATUS_SYN_RECV;
+        case 0x04: return CONN_STATUS_FIN_WAIT1;
+        case 0x05: return CONN_STATUS_FIN_WAIT2;
+        case 0x06: return CONN_STATUS_TIME_WAIT;
+        case 0x07: return CONN_STATUS_CLOSE;
+        case 0x08: return CONN_STATUS_CLOSE_WAIT;
+        case 0x09: return CONN_STATUS_LAST_ACK;
+        case 0x0A: return CONN_STATUS_LISTEN;
+        case 0x0B: return CONN_STATUS_CLOSING;
+        default: return CONN_STATUS_UNKNOWN;
+    }
+}
+
+// 状态枚举转字符串
+static const char* status_enum_to_str(ConnectionStatus status) {
+    switch (status) {
+        case CONN_STATUS_ESTABLISHED: return "ESTABLISHED";
+        case CONN_STATUS_SYN_SENT: return "SYN_SENT";
+        case CONN_STATUS_SYN_RECV: return "SYN_RECV";
+        case CONN_STATUS_FIN_WAIT1: return "FIN_WAIT1";
+        case CONN_STATUS_FIN_WAIT2: return "FIN_WAIT2";
+        case CONN_STATUS_TIME_WAIT: return "TIME_WAIT";
+        case CONN_STATUS_CLOSE: return "CLOSE";
+        case CONN_STATUS_CLOSE_WAIT: return "CLOSE_WAIT";
+        case CONN_STATUS_LAST_ACK: return "LAST_ACK";
+        case CONN_STATUS_LISTEN: return "LISTEN";
+        case CONN_STATUS_CLOSING: return "CLOSING";
+        case CONN_STATUS_NONE: return "NONE";
         default: return "UNKNOWN";
     }
 }
@@ -44,7 +63,8 @@ static void get_process_name(unsigned long target_inode, int32_t *pid, char *pro
     while ((entry = readdir(dir))) {
         if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
 
-        char fd_path[256];
+        // 使用更大的缓冲区避免截断警告
+        char fd_path[512];
         snprintf(fd_path, sizeof(fd_path), "/proc/%s/fd", entry->d_name);
         DIR *fd_dir = opendir(fd_path);
         if (!fd_dir) continue;
@@ -52,7 +72,8 @@ static void get_process_name(unsigned long target_inode, int32_t *pid, char *pro
         struct dirent *fd_entry;
         int found = 0;
         while ((fd_entry = readdir(fd_dir))) {
-            char link_path[512], target[512];
+            // 使用更大的缓冲区避免截断警告
+            char link_path[1024], target[1024];
             snprintf(link_path, sizeof(link_path), "%s/%s", fd_path, fd_entry->d_name);
             ssize_t len = readlink(link_path, target, sizeof(target) - 1);
             if (len != -1) {
@@ -61,13 +82,18 @@ static void get_process_name(unsigned long target_inode, int32_t *pid, char *pro
                 if (sscanf(target, "socket:[%lu]", &inode) == 1) {
                     if (inode == target_inode) {
                         *pid = atoi(entry->d_name);
-                        char comm_path[256];
+                        char comm_path[512];
                         snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", entry->d_name);
                         FILE *comm_fp = fopen(comm_path, "r");
                         if (comm_fp) {
-                            if (fgets(process, 256, comm_fp)) {
-                                size_t l = strlen(process);
-                                if (l > 0 && process[l-1] == '\n') process[l-1] = '\0';
+                            // 使用结构体定义的大小，避免硬编码
+                            char temp_buf[256];
+                            if (fgets(temp_buf, sizeof(temp_buf), comm_fp)) {
+                                size_t l = strlen(temp_buf);
+                                if (l > 0 && temp_buf[l-1] == '\n') temp_buf[l-1] = '\0';
+                                // 安全复制到目标缓冲区
+                                strncpy(process, temp_buf, 255);
+                                process[255] = '\0';
                             }
                             fclose(comm_fp);
                         }
@@ -88,12 +114,22 @@ static int parse_proc_file(const char *filename, const char *proto, ConnectionIn
     if (!fp) return 0;
 
     char line[256];
-    fgets(line, sizeof(line), fp); // 跳过标题行
+    // 检查 fgets 返回值以消除警告
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return 0;
+    }
 
     while (fgets(line, sizeof(line), fp)) {
         if (*count >= *capacity) {
             *capacity *= 2;
-            *conns = realloc(*conns, sizeof(ConnectionInfo) * (*capacity));
+            // 修复内存泄漏：使用临时指针检查 realloc 结果
+            ConnectionInfo *temp = realloc(*conns, sizeof(ConnectionInfo) * (*capacity));
+            if (!temp) {
+                fclose(fp);
+                return 0; // 内存分配失败
+            }
+            *conns = temp;
         }
 
         char local_addr_hex[64], remote_addr_hex[64];
@@ -107,7 +143,10 @@ static int parse_proc_file(const char *filename, const char *proto, ConnectionIn
             strncpy(c->protocol, proto, sizeof(c->protocol));
             hex_to_ip(local_addr_hex, c->local_addr);
             hex_to_ip(remote_addr_hex, c->remote_addr);
-            strncpy(c->status, get_status_str(proto, st), sizeof(c->status));
+            
+            // 设置状态枚举和字符串
+            c->status_enum = get_status_enum(proto, st);
+            strncpy(c->status, status_enum_to_str(c->status_enum), sizeof(c->status));
             
             c->pid = -1;
             strcpy(c->process, "N/A");
@@ -134,5 +173,6 @@ ConnectionInfo* scanner_get_connections(int *count) {
 }
 
 void scanner_free_connections(ConnectionInfo *conns, int count) {
+    (void)count; // 明确标记未使用参数
     if (conns) free(conns);
 }

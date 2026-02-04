@@ -37,21 +37,39 @@ static void win_addr_to_str(DWORD addr, WORD port, char *out) {
     sprintf(out, "%s:%d", inet_ntoa(ip), ntohs(port));
 }
 
-// TCP 状态映射
-static const char* win_tcp_status(DWORD st) {
+// TCP 状态映射（返回枚举）
+static ConnectionStatus win_tcp_status_enum(DWORD st) {
     switch (st) {
-        case MIB_TCP_STATE_CLOSED: return "CLOSE";
-        case MIB_TCP_STATE_LISTEN: return "LISTEN";
-        case MIB_TCP_STATE_SYN_SENT: return "SYN_SENT";
-        case MIB_TCP_STATE_SYN_RCVD: return "SYN_RECV";
-        case MIB_TCP_STATE_ESTAB: return "ESTABLISHED";
-        case MIB_TCP_STATE_FIN_WAIT1: return "FIN_WAIT1";
-        case MIB_TCP_STATE_FIN_WAIT2: return "FIN_WAIT2";
-        case MIB_TCP_STATE_CLOSE_WAIT: return "CLOSE_WAIT";
-        case MIB_TCP_STATE_CLOSING: return "CLOSING";
-        case MIB_TCP_STATE_LAST_ACK: return "LAST_ACK";
-        case MIB_TCP_STATE_TIME_WAIT: return "TIME_WAIT";
-        case MIB_TCP_STATE_DELETE_TCB: return "DELETE";
+        case MIB_TCP_STATE_CLOSED: return CONN_STATUS_CLOSE;
+        case MIB_TCP_STATE_LISTEN: return CONN_STATUS_LISTEN;
+        case MIB_TCP_STATE_SYN_SENT: return CONN_STATUS_SYN_SENT;
+        case MIB_TCP_STATE_SYN_RCVD: return CONN_STATUS_SYN_RECV;
+        case MIB_TCP_STATE_ESTAB: return CONN_STATUS_ESTABLISHED;
+        case MIB_TCP_STATE_FIN_WAIT1: return CONN_STATUS_FIN_WAIT1;
+        case MIB_TCP_STATE_FIN_WAIT2: return CONN_STATUS_FIN_WAIT2;
+        case MIB_TCP_STATE_CLOSE_WAIT: return CONN_STATUS_CLOSE_WAIT;
+        case MIB_TCP_STATE_CLOSING: return CONN_STATUS_CLOSING;
+        case MIB_TCP_STATE_LAST_ACK: return CONN_STATUS_LAST_ACK;
+        case MIB_TCP_STATE_TIME_WAIT: return CONN_STATUS_TIME_WAIT;
+        default: return CONN_STATUS_UNKNOWN;
+    }
+}
+
+// 状态枚举转字符串
+static const char* status_enum_to_str(ConnectionStatus status) {
+    switch (status) {
+        case CONN_STATUS_CLOSE: return "CLOSE";
+        case CONN_STATUS_LISTEN: return "LISTEN";
+        case CONN_STATUS_SYN_SENT: return "SYN_SENT";
+        case CONN_STATUS_SYN_RECV: return "SYN_RECV";
+        case CONN_STATUS_ESTABLISHED: return "ESTABLISHED";
+        case CONN_STATUS_FIN_WAIT1: return "FIN_WAIT1";
+        case CONN_STATUS_FIN_WAIT2: return "FIN_WAIT2";
+        case CONN_STATUS_CLOSE_WAIT: return "CLOSE_WAIT";
+        case CONN_STATUS_CLOSING: return "CLOSING";
+        case CONN_STATUS_LAST_ACK: return "LAST_ACK";
+        case CONN_STATUS_TIME_WAIT: return "TIME_WAIT";
+        case CONN_STATUS_NONE: return "NONE";
         default: return "UNKNOWN";
     }
 }
@@ -70,13 +88,23 @@ ConnectionInfo* scanner_get_connections(int *count) {
         for (DWORD i = 0; i < pTcpTable->dwNumEntries; i++) {
             if (n >= capacity) {
                 capacity *= 2;
-                conns = realloc(conns, sizeof(ConnectionInfo) * capacity);
+                // 修复内存泄漏：使用临时指针检查 realloc 结果
+                ConnectionInfo *temp = realloc(conns, sizeof(ConnectionInfo) * capacity);
+                if (!temp) {
+                    free(pTcpTable);
+                    free(conns);
+                    *count = 0;
+                    return NULL; // 内存分配失败
+                }
+                conns = temp;
             }
             ConnectionInfo *c = &conns[n++];
             strcpy(c->protocol, "TCP");
             win_addr_to_str(pTcpTable->table[i].dwLocalAddr, (WORD)pTcpTable->table[i].dwLocalPort, c->local_addr);
             win_addr_to_str(pTcpTable->table[i].dwRemoteAddr, (WORD)pTcpTable->table[i].dwRemotePort, c->remote_addr);
-            strcpy(c->status, win_tcp_status(pTcpTable->table[i].dwState));
+            // 设置状态枚举和字符串
+            c->status_enum = win_tcp_status_enum(pTcpTable->table[i].dwState);
+            strcpy(c->status, status_enum_to_str(c->status_enum));
             c->pid = pTcpTable->table[i].dwOwningPid;
             get_win_process_name(c->pid, c->process);
         }
@@ -91,12 +119,22 @@ ConnectionInfo* scanner_get_connections(int *count) {
         for (DWORD i = 0; i < pUdpTable->dwNumEntries; i++) {
             if (n >= capacity) {
                 capacity *= 2;
-                conns = realloc(conns, sizeof(ConnectionInfo) * capacity);
+                // 修复内存泄漏：使用临时指针检查 realloc 结果
+                ConnectionInfo *temp = realloc(conns, sizeof(ConnectionInfo) * capacity);
+                if (!temp) {
+                    free(pUdpTable);
+                    free(conns);
+                    *count = 0;
+                    return NULL; // 内存分配失败
+                }
+                conns = temp;
             }
             ConnectionInfo *c = &conns[n++];
             strcpy(c->protocol, "UDP");
             win_addr_to_str(pUdpTable->table[i].dwLocalAddr, (WORD)pUdpTable->table[i].dwLocalPort, c->local_addr);
             strcpy(c->remote_addr, "0.0.0.0:0");
+            // UDP 无状态
+            c->status_enum = CONN_STATUS_NONE;
             strcpy(c->status, "NONE");
             c->pid = pUdpTable->table[i].dwOwningPid;
             get_win_process_name(c->pid, c->process);
@@ -109,6 +147,7 @@ ConnectionInfo* scanner_get_connections(int *count) {
 }
 
 void scanner_free_connections(ConnectionInfo *conns, int count) {
+    (void)count; // 明确标记未使用参数
     if (conns) free(conns);
 }
 
