@@ -8,6 +8,7 @@
 #else
 #include <termios.h>
 #include <fcntl.h>
+#include <signal.h>
 #endif
 
 #include "backend/scanner.h"
@@ -38,6 +39,9 @@ int scroll_offset = 0;
 char search_filter[64] = "";
 int is_searching = 0;
 SortMode current_sort = SORT_NONE;
+int selected_idx = 0; // 当前选中的列表行索引
+int show_detail = 0;  // 是否显示详情浮窗
+int kill_confirm = 0; // 是否处于终止确认状态
 
 // 国际化文本结构
 struct {
@@ -245,6 +249,42 @@ void push_history(int total) {
     history_idx = (history_idx + 1) % TREND_HISTORY_SIZE;
 }
 
+// 绘制趋势字符图
+void draw_sparkline() {
+    const char* bars[] = {" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+    int max = 1;
+    for (int i=0; i<TREND_HISTORY_SIZE; i++) if(total_conn_history[i] > max) max = total_conn_history[i];
+    
+    printf(CL_CYN " TREND: " CLR_RST);
+    for (int i=0; i<TREND_HISTORY_SIZE; i++) {
+        int idx = (history_idx + i) % TREND_HISTORY_SIZE;
+        int bar_idx = (total_conn_history[idx] * 7) / max;
+        printf("%s", bars[bar_idx]);
+    }
+    printf("\n");
+}
+
+// 显示详情浮窗
+void show_detail_overlay(ConnectionInfo *conn) {
+    printf("\033[H\033[J"); // 清屏
+    printf("\n\n" CL_BLD "  ┌────────────────────────────────────────────────────────────┐\n");
+    printf("  │ " CL_MAG "PROCESS DETAILS" CLR_RST "                                          │\n");
+    printf("  ├────────────────────────────────────────────────────────────┤\n");
+    printf("  │ " CL_CYN "PID:       " CLR_RST "%-48d │\n", conn->pid);
+    printf("  │ " CL_CYN "COMM:      " CLR_RST "%-48s │\n", conn->process);
+    printf("  │ " CL_CYN "PROTO/ST:  " CLR_RST "%-48s │\n", conn->status);
+    printf("  │ " CL_CYN "LOCAL:     " CLR_RST "%-48s │\n", conn->local_addr);
+    printf("  │ " CL_CYN "REMOTE:    " CLR_RST "%-48s │\n", conn->remote_addr);
+    printf("  │ " CL_CYN "EXE PATH:  " CLR_RST "%-48.48s │\n", conn->exe_path);
+    if (strlen(conn->exe_path) > 48)
+    printf("  │            %-48.48s │\n", conn->exe_path + 48);
+    printf("  │ " CL_RED "RISK:      " CLR_RST "%-48s │\n", strlen(conn->risk_reason) ? conn->risk_reason : "Safe");
+    printf("  ├────────────────────────────────────────────────────────────┤\n");
+    printf("  │ " CL_YLW "Press ANY KEY to return" CLR_RST "                                  │\n");
+    printf("  └────────────────────────────────────────────────────────────┘\n");
+    fflush(stdout);
+}
+
 void push_snapshot(ConnectionInfo *conns, int count) {
     // 释放最旧的
     if (history_snapshots[snapshot_idx].conns) {
@@ -342,12 +382,15 @@ int main(int argc, char **argv) {
         }
 
         clear_screen();
-        printf(CL_BLD CL_GRN " %s " CLR_RST "  [%s]\n\n", ui_text.title, ui_text.ctrl_hint);
+        printf(CL_BLD CL_GRN " %s " CLR_RST "  [%s]\n", ui_text.title, ui_text.ctrl_hint);
+        draw_sparkline();
+        printf("\n");
         
         draw_stats_board(&stats);
         draw_sidebar();
         printf("\n");
 
+        // 列表展示头部
         printf(CL_BLD);
         print_padded(ui_text.col_proto, 6);
         print_padded(ui_text.col_local, 22);
@@ -359,7 +402,8 @@ int main(int argc, char **argv) {
         printf(" ───────────────────────────────────────────────────────────────────────────────────\n");
 
         int match_count = 0;
-        for (int i = 0; i < count; i++) {
+        ConnectionInfo *filtered_conns[512]; // 用于处理选中态的局部指针映射
+        for (int i = 0; i < count && match_count < 512; i++) {
             int vm = 0;
             switch (current_view) {
                 case VIEW_OVERVIEW: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED && is_external_connection(&conns[i])) vm = 1; break;
@@ -368,79 +412,109 @@ int main(int argc, char **argv) {
                 case VIEW_LISTEN: if (conns[i].status_enum == CONN_STATUS_LISTEN) vm = 1; break;
                 case VIEW_SUSPICIOUS: if (strlen(conns[i].risk_reason) > 0) vm = 1; break;
             }
+
             if (vm && strlen(search_filter) > 0) {
-                if (!strstr(conns[i].process, search_filter) && !strstr(conns[i].remote_addr, search_filter)) vm = 0;
+                if (strstr(conns[i].process, search_filter) == NULL && 
+                    strstr(conns[i].remote_addr, search_filter) == NULL) {
+                    vm = 0;
+                }
             }
-            if (vm) match_count++;
+            if (vm) filtered_conns[match_count++] = &conns[i];
         }
         internal_count_cache = match_count;
 
+        // 滚动与选择自适应
         int display_limit = 15; 
-        if (scroll_offset < 0) scroll_offset = 0;
-        if (match_count > display_limit && scroll_offset > match_count - display_limit) 
-            scroll_offset = match_count - display_limit;
-        if (match_count <= display_limit) scroll_offset = 0;
+        if (selected_idx >= match_count && match_count > 0) selected_idx = match_count - 1;
+        if (selected_idx < 0) selected_idx = 0;
+        
+        if (selected_idx < scroll_offset) scroll_offset = selected_idx;
+        if (selected_idx >= scroll_offset + display_limit) scroll_offset = selected_idx - display_limit + 1;
 
-        int skip = scroll_offset;
         int rendered = 0;
-        for (int i = 0; i < count && rendered < display_limit; i++) {
-            int vm = 0;
-            switch (current_view) {
-                case VIEW_OVERVIEW: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED && is_external_connection(&conns[i])) vm = 1; break;
-                case VIEW_ALL: vm = 1; break;
-                case VIEW_ESTABLISHED: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED) vm = 1; break;
-                case VIEW_LISTEN: if (conns[i].status_enum == CONN_STATUS_LISTEN) vm = 1; break;
-                case VIEW_SUSPICIOUS: if (strlen(conns[i].risk_reason) > 0) vm = 1; break;
-            }
-            if (vm && strlen(search_filter) > 0) {
-                if (!strstr(conns[i].process, search_filter) && !strstr(conns[i].remote_addr, search_filter)) vm = 0;
-            }
+        for (int i = scroll_offset; i < match_count && rendered < display_limit; i++) {
+            const char *st_clr = CLR_RST;
+            if (filtered_conns[i]->status_enum == CONN_STATUS_ESTABLISHED) st_clr = CL_GRN;
+            if (strlen(filtered_conns[i]->risk_reason) > 0) st_clr = BG_RED;
 
-            if (vm) {
-                if (skip > 0) { skip--; continue; }
-                const char *st_clr = CLR_RST;
-                if (conns[i].status_enum == CONN_STATUS_ESTABLISHED) st_clr = CL_GRN;
-                if (strlen(conns[i].risk_reason) > 0) st_clr = BG_RED;
-
-                print_padded(conns[i].protocol, 6);
-                print_padded(conns[i].local_addr, 22);
-                print_padded(conns[i].remote_addr, 22);
-                printf("%s", st_clr);
-                print_padded(trans_status(conns[i].status), 12);
-                printf(CLR_RST);
-                print_padded(conns[i].process, 12);
-                printf(CL_YLW);
-                print_padded(conns[i].risk_reason, 10);
-                printf(CLR_RST "\n");
-                rendered++;
-            }
+            if (i == selected_idx) printf("\033[7m"); 
+            
+            print_padded(filtered_conns[i]->protocol, 6);
+            print_padded(filtered_conns[i]->local_addr, 22);
+            print_padded(filtered_conns[i]->remote_addr, 22);
+            printf("%s", st_clr);
+            print_padded(trans_status(filtered_conns[i]->status), 12);
+            printf(CLR_RST);
+            if (i == selected_idx) printf("\033[7m");
+            print_padded(filtered_conns[i]->process, 12);
+            printf(CL_YLW);
+            print_padded(filtered_conns[i]->risk_reason, 10);
+            printf(CLR_RST "\n");
+            rendered++;
         }
 
         if (rendered == 0) printf("\n   (%s)\n", ui_text.no_data);
+        else {
+            printf("\n" CL_CYN "   [#%d/%d %s | Enter:%s | K:%s]\n" CLR_RST, 
+                   selected_idx + 1, match_count, 
+                   (current_lang == LANG_CN ? "已选中" : "Selected"),
+                   (current_lang == LANG_CN ? "详情" : "Detail"),
+                   (current_lang == LANG_CN ? "终止" : "Kill"));
+        }
         
-        // 3. 存储本轮快照用于下轮对比
+        if (kill_confirm && match_count > 0) {
+            printf(BG_RED " CONFIRM KILL PID %d (%s)? [y/N]: " CLR_RST, 
+                   filtered_conns[selected_idx]->pid, filtered_conns[selected_idx]->process);
+            fflush(stdout);
+        }
+
         push_snapshot(conns, count);
-        
         scanner_free_connections(conns, count);
         fflush(stdout);
 
+        // 输入采集与轮询
         for (int i = 0; i < REFRESH_POLL_ITERATIONS; i++) {
             int key = get_key();
-            // ... 输入处理保持不变 ...
             if (key == -1) { usleep(POLL_INTERVAL_US); continue; }
+
+            if (kill_confirm) {
+                if (key == 'y' || key == 'Y') {
+                    #ifndef _WIN32
+                    if (selected_idx < match_count) kill(filtered_conns[selected_idx]->pid, 15);
+                    #endif
+                }
+                kill_confirm = 0;
+                break;
+            }
+
             if (is_searching) {
                 if (key == 10 || key == 13 || key == 27) is_searching = 0;
                 else if (key == 8 || key == 127) { int l = strlen(search_filter); if (l > 0) search_filter[l - 1] = '\0'; }
-                else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; scroll_offset = 0; }
+                else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { 
+                    int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; 
+                    selected_idx = 0; scroll_offset = 0;
+                }
                 break;
             }
-            if (key == 'q' || key == 'Q') { set_non_blocking_input(0); return 0; }
+
+            if (key == 'q' || key == 'Q') { set_non_blocking_input(0); printf("\nExiting...\n"); return 0; }
             if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; break; }
             if (key == '/') { is_searching = 1; search_filter[0] = '\0'; break; }
             if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); break; }
-            if (key == 'j' || key == 'J') { if (scroll_offset + display_limit < internal_count_cache) scroll_offset++; break; }
-            if (key == 'k' || key == 'K') { if (scroll_offset > 0) scroll_offset--; break; }
-            if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); scroll_offset = 0; break; }
+            if (key == 'j' || key == 'J') { if (selected_idx < match_count - 1) selected_idx++; break; }
+            if (key == 'k' || key == 'K') { if (selected_idx > 0) selected_idx--; break; }
+            if (key == 'k' || key == 'K') { // 这里需要区分小写 k (上移) 和 大写 K (Kill)
+                // 已经在上面处理了 j/k，现在识别大写 K
+            }
+            if (key == 'K') { if (match_count > 0 && filtered_conns[selected_idx]->pid > 0) kill_confirm = 1; break; }
+            if (key == 10 || key == 13) { // Enter
+                if (match_count > 0) {
+                    show_detail_overlay(filtered_conns[selected_idx]);
+                    while(get_key() == -1) usleep(50000); // 等待任意键返回
+                }
+                break;
+            }
+            if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); selected_idx = 0; scroll_offset = 0; break; }
             usleep(POLL_INTERVAL_US);
         }
     }
