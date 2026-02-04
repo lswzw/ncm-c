@@ -12,6 +12,8 @@
 #endif
 
 #include "backend/scanner.h"
+#include "backend/kernel_probe.h"
+#include "backend/nl_listener.h"
 
 // 配置常量
 #define MAX_OVERVIEW_DISPLAY 12      // 总览最多显示的连接数
@@ -32,7 +34,7 @@
 // 语言与视图状态
 typedef enum { LANG_CN, LANG_EN } LangType;
 typedef enum { VIEW_OVERVIEW = 1, VIEW_ALL, VIEW_ESTABLISHED, VIEW_LISTEN, VIEW_SUSPICIOUS } ViewType;
-
+// 全局配置与状态
 LangType current_lang = LANG_CN;
 ViewType current_view = VIEW_OVERVIEW;
 int scroll_offset = 0;
@@ -43,6 +45,10 @@ int selected_idx = 0; // 当前选中的列表行索引
 int show_detail = 0;  // 是否显示详情浮窗
 int kill_confirm = 0; // 是否处于终止确认状态
 
+// 驱动状态
+DriverTier current_tier = DRIVER_POLLING;
+int nl_fd = -1;
+
 // 国际化文本结构
 struct {
     const char *title;
@@ -50,6 +56,7 @@ struct {
     const char *scroll_hint;
     const char *search_hint;
     const char *sort_hint;
+    const char *driver_label;
     const char *search_label;
     const char *sort_label;
     const char *board_total;
@@ -77,6 +84,7 @@ void update_ui_text() {
         ui_text.scroll_hint = "J/K 滚动";
         ui_text.search_hint = "/ 搜索";
         ui_text.sort_hint = "S 排序";
+        ui_text.driver_label = "驱动级别";
         ui_text.search_label = "搜索关键词";
         ui_text.sort_label = "排序模式";
         ui_text.board_total = "总连接数";
@@ -101,6 +109,7 @@ void update_ui_text() {
         ui_text.scroll_hint = "J/K:Scroll";
         ui_text.search_hint = "/:Search";
         ui_text.sort_hint = "S:Sort";
+        ui_text.driver_label = "DRIVER";
         ui_text.search_label = "Filter";
         ui_text.sort_label = "Sort";
         ui_text.board_total = "TOTAL CONNS";
@@ -330,7 +339,11 @@ void draw_sidebar() {
 }
 
 int main(int argc, char **argv) {
-    // ... 原有参数处理 ...
+    // 1. 驱动选择
+    current_tier = probe_kernel_features();
+    if (current_tier == DRIVER_NETLINK) nl_fd = nl_init_listener();
+    
+    // 原有参数处理
     if (argc == 3 && strcmp(argv[1], "-e") == 0) {
         int count = 0;
         ConnectionInfo *conns = scanner_get_connections(&count);
@@ -351,23 +364,17 @@ int main(int argc, char **argv) {
         
         if (!conns && count == 0) {
             clear_screen();
-            printf(CL_BLD CL_RED "Error: Failed to scan network connections\n" CLR_RST);
+            printf(CL_BLD CL_RED "Error: Connection Scan Failed\n" CLR_RST);
             sleep(1);
             continue;
         }
         
-        // 1. 采集历史
         push_history(count);
-        
         ConnectionStats stats;
         calculate_stats(conns, count, &stats);
         
-        // 2. 频率二次判定与风险高亮
         for (int i = 0; i < count; i++) {
-            // 先用逻辑层做一遍判定
             is_suspicious(&conns[i]);
-            
-            // 补充频率判定
             int cur_proc_conns = 0;
             if (conns[i].pid > 0) {
                 for(int j=0; j<count; j++) if(conns[j].pid == conns[i].pid) cur_proc_conns++;
@@ -377,12 +384,11 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (current_sort != SORT_NONE) {
-            sort_connections(conns, count, current_sort);
-        }
+        if (current_sort != SORT_NONE) sort_connections(conns, count, current_sort);
 
         clear_screen();
-        printf(CL_BLD CL_GRN " %s " CLR_RST "  [%s]\n", ui_text.title, ui_text.ctrl_hint);
+        printf(CL_BLD CL_GRN " %s " CLR_RST "  [%s]  " CL_YLW "[%s: %s]" CLR_RST "\n", 
+               ui_text.title, ui_text.ctrl_hint, ui_text.driver_label, get_driver_name(current_tier));
         draw_sparkline();
         printf("\n");
         
@@ -390,7 +396,6 @@ int main(int argc, char **argv) {
         draw_sidebar();
         printf("\n");
 
-        // 列表展示头部
         printf(CL_BLD);
         print_padded(ui_text.col_proto, 6);
         print_padded(ui_text.col_local, 22);
@@ -402,8 +407,13 @@ int main(int argc, char **argv) {
         printf(" ───────────────────────────────────────────────────────────────────────────────────\n");
 
         int match_count = 0;
-        ConnectionInfo *filtered_conns[512]; // 用于处理选中态的局部指针映射
-        for (int i = 0; i < count && match_count < 512; i++) {
+        ConnectionInfo **filtered_conns = malloc(sizeof(ConnectionInfo*) * (count > 0 ? count : 1));
+        if (!filtered_conns) {
+            scanner_free_connections(conns, count);
+            continue; 
+        }
+
+        for (int i = 0; i < count; i++) {
             int vm = 0;
             switch (current_view) {
                 case VIEW_OVERVIEW: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED && is_external_connection(&conns[i])) vm = 1; break;
@@ -462,7 +472,7 @@ int main(int argc, char **argv) {
                    (current_lang == LANG_CN ? "终止" : "Kill"));
         }
         
-        if (kill_confirm && match_count > 0) {
+        if (kill_confirm && match_count > 0 && selected_idx < match_count) {
             printf(BG_RED " CONFIRM KILL PID %d (%s)? [y/N]: " CLR_RST, 
                    filtered_conns[selected_idx]->pid, filtered_conns[selected_idx]->process);
             fflush(stdout);
@@ -472,51 +482,56 @@ int main(int argc, char **argv) {
         scanner_free_connections(conns, count);
         fflush(stdout);
 
-        // 输入采集与轮询
+        // 统一输入与驱动事件轮询 (双引擎驱动)
+        int force_refresh = 0;
         for (int i = 0; i < REFRESH_POLL_ITERATIONS; i++) {
+            // A. 处理用户输入
             int key = get_key();
-            if (key == -1) { usleep(POLL_INTERVAL_US); continue; }
-
-            if (kill_confirm) {
-                if (key == 'y' || key == 'Y') {
+            if (key != -1) {
+                if (kill_confirm) {
+                    if (key == 'y' || key == 'Y') {
                     #ifndef _WIN32
-                    if (selected_idx < match_count) kill(filtered_conns[selected_idx]->pid, 15);
+                    if (match_count > 0 && selected_idx < match_count) {
+                        kill(filtered_conns[selected_idx]->pid, 15);
+                    }
                     #endif
                 }
-                kill_confirm = 0;
-                break;
+                    kill_confirm = 0; force_refresh = 1;
+                } else if (is_searching) {
+                    if (key == 10 || key == 13 || key == 27) is_searching = 0;
+                    else if (key == 8 || key == 127) { int l = strlen(search_filter); if (l > 0) search_filter[l - 1] = '\0'; }
+                    else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { 
+                        int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; 
+                        selected_idx = 0; scroll_offset = 0;
+                    }
+                    force_refresh = 1;
+                } else {
+                    if (key == 'q' || key == 'Q') { set_non_blocking_input(0); printf("\nExiting...\n"); return 0; }
+                    if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; force_refresh = 1; }
+                    if (key == '/') { is_searching = 1; search_filter[0] = '\0'; force_refresh = 1; }
+                    if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); force_refresh = 1; }
+                    if (key == 'j' || key == 'J') { if (selected_idx < match_count - 1) { selected_idx++; force_refresh = 1; } }
+                    if (key == 'k' || key == 'K') { if (selected_idx > 0) { selected_idx--; force_refresh = 1; } }
+                    if (key == 'K') { if (match_count > 0 && filtered_conns[selected_idx]->pid > 0) { kill_confirm = 1; force_refresh = 1; } }
+                    if (key == 10 || key == 13) { 
+                        if (match_count > 0) { show_detail_overlay(filtered_conns[selected_idx]); while(get_key() == -1) usleep(50000); }
+                        force_refresh = 1;
+                    }
+                    if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); selected_idx = 0; scroll_offset = 0; force_refresh = 1; }
+                }
             }
 
-            if (is_searching) {
-                if (key == 10 || key == 13 || key == 27) is_searching = 0;
-                else if (key == 8 || key == 127) { int l = strlen(search_filter); if (l > 0) search_filter[l - 1] = '\0'; }
-                else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { 
-                    int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; 
-                    selected_idx = 0; scroll_offset = 0;
+            // B. 处理内核驱动事件 (Tier 2: Netlink 触发器)
+            if (current_tier == DRIVER_NETLINK && nl_fd != -1) {
+                if (nl_wait_for_event(nl_fd) == 1) {
+                    force_refresh = 1; // 捕获到 exec，立即扫描
                 }
-                break;
             }
 
-            if (key == 'q' || key == 'Q') { set_non_blocking_input(0); printf("\nExiting...\n"); return 0; }
-            if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; break; }
-            if (key == '/') { is_searching = 1; search_filter[0] = '\0'; break; }
-            if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); break; }
-            if (key == 'j' || key == 'J') { if (selected_idx < match_count - 1) selected_idx++; break; }
-            if (key == 'k' || key == 'K') { if (selected_idx > 0) selected_idx--; break; }
-            if (key == 'k' || key == 'K') { // 这里需要区分小写 k (上移) 和 大写 K (Kill)
-                // 已经在上面处理了 j/k，现在识别大写 K
-            }
-            if (key == 'K') { if (match_count > 0 && filtered_conns[selected_idx]->pid > 0) kill_confirm = 1; break; }
-            if (key == 10 || key == 13) { // Enter
-                if (match_count > 0) {
-                    show_detail_overlay(filtered_conns[selected_idx]);
-                    while(get_key() == -1) usleep(50000); // 等待任意键返回
-                }
-                break;
-            }
-            if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); selected_idx = 0; scroll_offset = 0; break; }
+            if (force_refresh) break;
             usleep(POLL_INTERVAL_US);
         }
+        free(filtered_conns);
     }
 
     set_non_blocking_input(0);

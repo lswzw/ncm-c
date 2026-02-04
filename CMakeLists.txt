@@ -21,6 +21,8 @@ endif()
 set(SOURCES
     main.c
     backend/scanner.h
+    backend/kernel_probe.c
+    backend/nl_listener.c
     lib/logic.c
     export_html.c
     ${PLATFORM_SOURCES}
