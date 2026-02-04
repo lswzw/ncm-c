@@ -1,0 +1,15 @@
+# 构建产物
+build/
+bin/
+obj/
+
+# 编译器/IDE 相关
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# 临时文件与日志
+*.log
+*.tmp
