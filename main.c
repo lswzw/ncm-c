@@ -225,6 +225,60 @@ void draw_stats_board(ConnectionStats *stats) {
     printf("────────────────────────────────────────────────────────────────────────────────────\n");
 }
 
+// 聚合历史缓存 (60个点)
+#define TREND_HISTORY_SIZE 60
+int total_conn_history[TREND_HISTORY_SIZE];
+int history_idx = 0;
+
+// 全量快照缓存 (5轮)
+#define BEHAVIOR_SNAPSHOTS 5
+typedef struct {
+    ConnectionInfo *conns;
+    int count;
+} HistorySnapshot;
+
+HistorySnapshot history_snapshots[BEHAVIOR_SNAPSHOTS];
+int snapshot_idx = 0;
+
+void push_history(int total) {
+    total_conn_history[history_idx] = total;
+    history_idx = (history_idx + 1) % TREND_HISTORY_SIZE;
+}
+
+void push_snapshot(ConnectionInfo *conns, int count) {
+    // 释放最旧的
+    if (history_snapshots[snapshot_idx].conns) {
+        free(history_snapshots[snapshot_idx].conns);
+    }
+    
+    // 深度拷贝当前快照
+    history_snapshots[snapshot_idx].count = count;
+    history_snapshots[snapshot_idx].conns = malloc(sizeof(ConnectionInfo) * count);
+    if (history_snapshots[snapshot_idx].conns) {
+        memcpy(history_snapshots[snapshot_idx].conns, conns, sizeof(ConnectionInfo) * count);
+    }
+    
+    snapshot_idx = (snapshot_idx + 1) % BEHAVIOR_SNAPSHOTS;
+}
+
+// 检查某个进程是否在短时间内发起了大量新连接
+int check_frequency_spike(int32_t pid, int current_count) {
+    if (pid <= 0) return 0;
+    
+    int max_prev = 0;
+    for (int s = 0; s < BEHAVIOR_SNAPSHOTS; s++) {
+        if (!history_snapshots[s].conns) continue;
+        int prev_count = 0;
+        for (int i = 0; i < history_snapshots[s].count; i++) {
+            if (history_snapshots[s].conns[i].pid == pid) prev_count++;
+        }
+        if (prev_count > max_prev) max_prev = prev_count;
+    }
+    
+    // 如果当前连接数显著多于历史最高值（例如增加超过 5 个），判定为频率异常
+    return (current_count > max_prev + 5);
+}
+
 void draw_sidebar() {
     printf(CL_BLD " [%s] " CLR_RST, (current_lang == LANG_CN ? "菜单选择" : "VIEW"));
     printf(current_view == VIEW_OVERVIEW ? BG_RED " %s " CLR_RST : " %s ", ui_text.view_ov);
@@ -236,25 +290,20 @@ void draw_sidebar() {
 }
 
 int main(int argc, char **argv) {
-    // 处理命令行参数：ncm -e report.html
+    // ... 原有参数处理 ...
     if (argc == 3 && strcmp(argv[1], "-e") == 0) {
         int count = 0;
         ConnectionInfo *conns = scanner_get_connections(&count);
-        
-        if (!conns && count == 0) {
-            fprintf(stderr, "错误：无法扫描网络连接\n");
-            return 1;
-        }
-        
+        if (!conns && count == 0) return 1;
         int result = export_html_report(argv[2], conns, count);
         scanner_free_connections(conns, count);
         return result;
     }
     
-    // 原有 TUI 模式
     set_non_blocking_input(1);
+    memset(history_snapshots, 0, sizeof(history_snapshots));
     
-    int internal_count_cache = 0; // 用于平滑滚动限制
+    int internal_count_cache = 0;
     while (1) {
         update_ui_text();
         int count = 0;
@@ -267,10 +316,27 @@ int main(int argc, char **argv) {
             continue;
         }
         
+        // 1. 采集历史
+        push_history(count);
+        
         ConnectionStats stats;
         calculate_stats(conns, count, &stats);
         
-        // 在计算统计后，渲染显示前进行排序
+        // 2. 频率二次判定与风险高亮
+        for (int i = 0; i < count; i++) {
+            // 先用逻辑层做一遍判定
+            is_suspicious(&conns[i]);
+            
+            // 补充频率判定
+            int cur_proc_conns = 0;
+            if (conns[i].pid > 0) {
+                for(int j=0; j<count; j++) if(conns[j].pid == conns[i].pid) cur_proc_conns++;
+                if (check_frequency_spike(conns[i].pid, cur_proc_conns)) {
+                    strcpy(conns[i].risk_reason, "Spike");
+                }
+            }
+        }
+
         if (current_sort != SORT_NONE) {
             sort_connections(conns, count, current_sort);
         }
@@ -282,40 +348,33 @@ int main(int argc, char **argv) {
         draw_sidebar();
         printf("\n");
 
-        // 列表展示头部
         printf(CL_BLD);
-        print_padded(ui_text.col_proto, 8);
-        print_padded(ui_text.col_local, 24);
-        print_padded(ui_text.col_remote, 24);
-        print_padded(ui_text.col_status, 14);
+        print_padded(ui_text.col_proto, 6);
+        print_padded(ui_text.col_local, 22);
+        print_padded(ui_text.col_remote, 22);
+        print_padded(ui_text.col_status, 12);
         print_padded(ui_text.col_proc, 12);
+        print_padded("RISK", 10);
         printf(CLR_RST "\n");
         printf(" ───────────────────────────────────────────────────────────────────────────────────\n");
 
         int match_count = 0;
-        // 第一遍扫描：计算当前视图下匹配的总数 (包含搜索词过滤)
         for (int i = 0; i < count; i++) {
-            int view_matches = 0;
+            int vm = 0;
             switch (current_view) {
-                case VIEW_OVERVIEW: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED && is_external_connection(&conns[i])) view_matches = 1; break;
-                case VIEW_ALL: view_matches = 1; break;
-                case VIEW_ESTABLISHED: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED) view_matches = 1; break;
-                case VIEW_LISTEN: if (conns[i].status_enum == CONN_STATUS_LISTEN) view_matches = 1; break;
-                case VIEW_SUSPICIOUS: if (is_suspicious(&conns[i])) view_matches = 1; break;
+                case VIEW_OVERVIEW: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED && is_external_connection(&conns[i])) vm = 1; break;
+                case VIEW_ALL: vm = 1; break;
+                case VIEW_ESTABLISHED: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED) vm = 1; break;
+                case VIEW_LISTEN: if (conns[i].status_enum == CONN_STATUS_LISTEN) vm = 1; break;
+                case VIEW_SUSPICIOUS: if (strlen(conns[i].risk_reason) > 0) vm = 1; break;
             }
-
-            if (view_matches && strlen(search_filter) > 0) {
-                if (strstr(conns[i].process, search_filter) == NULL && 
-                    strstr(conns[i].remote_addr, search_filter) == NULL) {
-                    view_matches = 0;
-                }
+            if (vm && strlen(search_filter) > 0) {
+                if (!strstr(conns[i].process, search_filter) && !strstr(conns[i].remote_addr, search_filter)) vm = 0;
             }
-
-            if (view_matches) match_count++;
+            if (vm) match_count++;
         }
         internal_count_cache = match_count;
 
-        // 滚动边界检查
         int display_limit = 15; 
         if (scroll_offset < 0) scroll_offset = 0;
         if (match_count > display_limit && scroll_offset > match_count - display_limit) 
@@ -324,105 +383,64 @@ int main(int argc, char **argv) {
 
         int skip = scroll_offset;
         int rendered = 0;
-        // 第二遍扫描：实际渲染指定范围的数据
         for (int i = 0; i < count && rendered < display_limit; i++) {
-            int view_matches = 0;
+            int vm = 0;
             switch (current_view) {
-                case VIEW_OVERVIEW: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED && is_external_connection(&conns[i])) view_matches = 1; break;
-                case VIEW_ALL: view_matches = 1; break;
-                case VIEW_ESTABLISHED: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED) view_matches = 1; break;
-                case VIEW_LISTEN: if (conns[i].status_enum == CONN_STATUS_LISTEN) view_matches = 1; break;
-                case VIEW_SUSPICIOUS: if (is_suspicious(&conns[i])) view_matches = 1; break;
+                case VIEW_OVERVIEW: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED && is_external_connection(&conns[i])) vm = 1; break;
+                case VIEW_ALL: vm = 1; break;
+                case VIEW_ESTABLISHED: if (conns[i].status_enum == CONN_STATUS_ESTABLISHED) vm = 1; break;
+                case VIEW_LISTEN: if (conns[i].status_enum == CONN_STATUS_LISTEN) vm = 1; break;
+                case VIEW_SUSPICIOUS: if (strlen(conns[i].risk_reason) > 0) vm = 1; break;
+            }
+            if (vm && strlen(search_filter) > 0) {
+                if (!strstr(conns[i].process, search_filter) && !strstr(conns[i].remote_addr, search_filter)) vm = 0;
             }
 
-            if (view_matches && strlen(search_filter) > 0) {
-                if (strstr(conns[i].process, search_filter) == NULL && 
-                    strstr(conns[i].remote_addr, search_filter) == NULL) {
-                    view_matches = 0;
-                }
-            }
-
-            if (view_matches) {
+            if (vm) {
                 if (skip > 0) { skip--; continue; }
-                
                 const char *st_clr = CLR_RST;
                 if (conns[i].status_enum == CONN_STATUS_ESTABLISHED) st_clr = CL_GRN;
-                else if (conns[i].status_enum == CONN_STATUS_LISTEN) st_clr = CL_CYN;
-                else if (conns[i].status_enum == CONN_STATUS_TIME_WAIT) st_clr = CL_YLW;
-                if (is_suspicious(&conns[i])) st_clr = BG_RED;
+                if (strlen(conns[i].risk_reason) > 0) st_clr = BG_RED;
 
-                print_padded(conns[i].protocol, 8);
-                print_padded(conns[i].local_addr, 24);
-                print_padded(conns[i].remote_addr, 24);
+                print_padded(conns[i].protocol, 6);
+                print_padded(conns[i].local_addr, 22);
+                print_padded(conns[i].remote_addr, 22);
                 printf("%s", st_clr);
-                print_padded(trans_status(conns[i].status), 14);
+                print_padded(trans_status(conns[i].status), 12);
                 printf(CLR_RST);
                 print_padded(conns[i].process, 12);
-                printf("\n");
+                printf(CL_YLW);
+                print_padded(conns[i].risk_reason, 10);
+                printf(CLR_RST "\n");
                 rendered++;
             }
         }
 
         if (rendered == 0) printf("\n   (%s)\n", ui_text.no_data);
-        else if (match_count > display_limit) {
-            printf(CL_CYN "\n   [已显示 %d-%d / 共 %d 项 | 使用 J/K 滚动]\n" CLR_RST, 
-                   scroll_offset + 1, scroll_offset + rendered, match_count);
-        }
+        
+        // 3. 存储本轮快照用于下轮对比
+        push_snapshot(conns, count);
         
         scanner_free_connections(conns, count);
         fflush(stdout);
 
-        // 输入采集与轮询
         for (int i = 0; i < REFRESH_POLL_ITERATIONS; i++) {
             int key = get_key();
+            // ... 输入处理保持不变 ...
             if (key == -1) { usleep(POLL_INTERVAL_US); continue; }
-
             if (is_searching) {
-                if (key == 10 || key == 13 || key == 27) { // Enter or Esc
-                    is_searching = 0;
-                } else if (key == 8 || key == 127) { // Backspace
-                    int len = strlen(search_filter);
-                    if (len > 0) search_filter[len - 1] = '\0';
-                } else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) {
-                    int len = strlen(search_filter);
-                    search_filter[len] = (char)key;
-                    search_filter[len + 1] = '\0';
-                    scroll_offset = 0; // 搜索时重置滚动
-                }
-                break; // 有输入即刷新
-            }
-
-            if (key == 'q' || key == 'Q') {
-                set_non_blocking_input(0);
-                printf("\nExiting...\n");
-                return 0;
-            }
-            if (key == 'l' || key == 'L') {
-                current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN;
+                if (key == 10 || key == 13 || key == 27) is_searching = 0;
+                else if (key == 8 || key == 127) { int l = strlen(search_filter); if (l > 0) search_filter[l - 1] = '\0'; }
+                else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; scroll_offset = 0; }
                 break;
             }
-            if (key == '/') {
-                is_searching = 1;
-                search_filter[0] = '\0';
-                break;
-            }
-            if (key == 's' || key == 'S') {
-                current_sort = (SortMode)((current_sort + 1) % 4); // 循环切换模式
-                break;
-            }
-            if (key == 'j' || key == 'J') {
-                if (scroll_offset + display_limit < internal_count_cache) scroll_offset++;
-                break;
-            }
-            if (key == 'k' || key == 'K') {
-                if (scroll_offset > 0) scroll_offset--;
-                break;
-            }
-            if (key >= '1' && key <= '5') {
-                current_view = (ViewType)(key - '0');
-                scroll_offset = 0; 
-                break;
-            }
+            if (key == 'q' || key == 'Q') { set_non_blocking_input(0); return 0; }
+            if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; break; }
+            if (key == '/') { is_searching = 1; search_filter[0] = '\0'; break; }
+            if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); break; }
+            if (key == 'j' || key == 'J') { if (scroll_offset + display_limit < internal_count_cache) scroll_offset++; break; }
+            if (key == 'k' || key == 'K') { if (scroll_offset > 0) scroll_offset--; break; }
+            if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); scroll_offset = 0; break; }
             usleep(POLL_INTERVAL_US);
         }
     }

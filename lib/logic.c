@@ -21,14 +21,31 @@ int is_external_connection(const ConnectionInfo *conn) {
     return !is_internal(conn->remote_addr);
 }
 
-// 判定可疑连接逻辑（使用枚举比较，性能更优）
+// 判定可疑连接逻辑
 int is_suspicious(const ConnectionInfo *conn) {
-    // 仅针对已建立的外部通信进行判定
-    if (conn->status_enum != CONN_STATUS_ESTABLISHED) return 0;
-    if (is_internal(conn->remote_addr)) return 0;
+    // 强制类型转换以修改结构体内部用于 UI 显示的字段（虽然建议在 scanner 或 logic 中统一处理）
+    ConnectionInfo *c = (ConnectionInfo *)conn;
+    c->risk_reason[0] = '\0';
+
+    // 1. 路径审计风险 (Path Audit)
+    if (strcmp(c->exe_path, "N/A") != 0 && strcmp(c->exe_path, "Access Denied") != 0) {
+        if (strstr(c->exe_path, "/tmp") || strstr(c->exe_path, "/var/tmp") || strstr(c->exe_path, "/dev/shm")) {
+            strcpy(c->risk_reason, "TempDir");
+            return 1;
+        }
+        // 检查隐藏路径（如 /home/user/.hidden/proc）
+        if (strstr(c->exe_path, "/.")) {
+            strcpy(c->risk_reason, "HiddenDir");
+            return 1;
+        }
+    }
+
+    // 2. 仅对已建立的外部通信进行进一步端口判定
+    if (c->status_enum != CONN_STATUS_ESTABLISHED) return 0;
+    if (is_internal(c->remote_addr)) return 0;
 
     // 提取端口
-    const char *port_ptr = strrchr(conn->remote_addr, ':');
+    const char *port_ptr = strrchr(c->remote_addr, ':');
     if (!port_ptr) return 0;
     int port = atoi(port_ptr + 1);
 
@@ -36,6 +53,8 @@ int is_suspicious(const ConnectionInfo *conn) {
     for (int i = 0; i < COMMON_PORTS_COUNT; i++) {
         if (port == COMMON_PORTS[i]) return 0;
     }
+    
+    strcpy(c->risk_reason, "UnusualPort");
     return 1;
 }
 

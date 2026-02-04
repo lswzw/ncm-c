@@ -54,8 +54,9 @@ static const char* status_enum_to_str(ConnectionStatus status) {
     }
 }
 
-// 获取进程名
-static void get_process_name(unsigned long target_inode, int32_t *pid, char *process) {
+// 获取进程名和执行路径
+static void get_process_name(unsigned long target_inode, int32_t *pid, char *process, char *exe_path) {
+    if (exe_path) strcpy(exe_path, "N/A");
     DIR *dir = opendir("/proc");
     if (!dir) return;
 
@@ -88,15 +89,26 @@ static void get_process_name(unsigned long target_inode, int32_t *pid, char *pro
                         if (comm_fp) {
                             // 使用结构体定义的大小，避免硬编码
                             char temp_buf[256];
-                            if (fgets(temp_buf, sizeof(temp_buf), comm_fp)) {
-                                size_t l = strlen(temp_buf);
-                                if (l > 0 && temp_buf[l-1] == '\n') temp_buf[l-1] = '\0';
                                 // 安全复制到目标缓冲区
-                                strncpy(process, temp_buf, 255);
-                                process[255] = '\0';
-                            }
+                                if (fgets(temp_buf, sizeof(temp_buf), comm_fp)) {
+                                    size_t l = strlen(temp_buf);
+                                    if (l > 0 && temp_buf[l-1] == '\n') temp_buf[l-1] = '\0';
+                                    strncpy(process, temp_buf, 255);
+                                    process[255] = '\0';
+                                }
                             fclose(comm_fp);
                         }
+                        
+                        // [NEW] 获取进程执行路径
+                        char exe_link[512];
+                        snprintf(exe_link, sizeof(exe_link), "/proc/%s/exe", entry->d_name);
+                        ssize_t exe_len = readlink(exe_link, exe_path, 511);
+                        if (exe_len != -1) {
+                            exe_path[exe_len] = '\0';
+                        } else {
+                            strcpy(exe_path, "Access Denied");
+                        }
+                        
                         found = 1;
                         break;
                     }
@@ -150,7 +162,9 @@ static int parse_proc_file(const char *filename, const char *proto, ConnectionIn
             
             c->pid = -1;
             strcpy(c->process, "N/A");
-            get_process_name(inode, &c->pid, c->process);
+            strcpy(c->exe_path, "N/A");
+            strcpy(c->risk_reason, "");
+            get_process_name(inode, &c->pid, c->process, c->exe_path);
             (*count)++;
         }
     }

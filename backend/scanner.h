@@ -29,6 +29,8 @@ typedef struct {
     ConnectionStatus status_enum;  // 枚举形式（用于比较）
     int32_t pid;
     char process[256];
+    char exe_path[512];  // 进程执行路径（用于审计）
+    char risk_reason[64]; // 风险原因描述（用于 UI）
 } ConnectionInfo;
 
 // 统计数据结构
