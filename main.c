@@ -9,6 +9,8 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/select.h>
+#include <errno.h>
 #endif
 
 #include "backend/scanner.h"
@@ -344,6 +346,15 @@ int main(int argc, char **argv) {
     if (current_tier == DRIVER_NETLINK) nl_fd = nl_init_listener();
     
     // 原有参数处理
+    if (argc > 1 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        printf("NCM - Network Connection Monitor v2.0\n");
+        printf("Usage: %s [options]\n", argv[0]);
+        printf("Options:\n");
+        printf("  -e <file>  Export connection report to HTML\n");
+        printf("  -h, --help Show this help message\n");
+        return 0;
+    }
+
     if (argc == 3 && strcmp(argv[1], "-e") == 0) {
         int count = 0;
         ConnectionInfo *conns = scanner_get_connections(&count);
@@ -482,54 +493,75 @@ int main(int argc, char **argv) {
         scanner_free_connections(conns, count);
         fflush(stdout);
 
-        // 统一输入与驱动事件轮询 (双引擎驱动)
+        // 统一输入与驱动事件轮询 (双引擎驱动 - Select 优化版)
         int force_refresh = 0;
+        int max_fd = (nl_fd > STDIN_FILENO) ? nl_fd : STDIN_FILENO;
+        
+        // 降低轮询强度：将外部 20 次循环改为 1 次阻塞等待
+        // 这里的 REFRESH_POLL_ITERATIONS 调整为内部逻辑控制
         for (int i = 0; i < REFRESH_POLL_ITERATIONS; i++) {
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(STDIN_FILENO, &readfds);
+            if (current_tier == DRIVER_NETLINK && nl_fd != -1) {
+                FD_SET(nl_fd, &readfds);
+            }
+
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = POLL_INTERVAL_US; // 0.1s 阻塞/超时
+
+            int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
+            
+            if (activity < 0 && errno != EINTR) break;
+            if (activity == 0) continue; // 超时，无事发生，继续下一次小轮询
+
             // A. 处理用户输入
-            int key = get_key();
-            if (key != -1) {
-                if (kill_confirm) {
-                    if (key == 'y' || key == 'Y') {
-                    #ifndef _WIN32
-                    if (match_count > 0 && selected_idx < match_count) {
-                        kill(filtered_conns[selected_idx]->pid, 15);
-                    }
-                    #endif
-                }
-                    kill_confirm = 0; force_refresh = 1;
-                } else if (is_searching) {
-                    if (key == 10 || key == 13 || key == 27) is_searching = 0;
-                    else if (key == 8 || key == 127) { int l = strlen(search_filter); if (l > 0) search_filter[l - 1] = '\0'; }
-                    else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { 
-                        int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; 
-                        selected_idx = 0; scroll_offset = 0;
-                    }
-                    force_refresh = 1;
-                } else {
-                    if (key == 'q' || key == 'Q') { set_non_blocking_input(0); printf("\nExiting...\n"); return 0; }
-                    if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; force_refresh = 1; }
-                    if (key == '/') { is_searching = 1; search_filter[0] = '\0'; force_refresh = 1; }
-                    if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); force_refresh = 1; }
-                    if (key == 'j' || key == 'J') { if (selected_idx < match_count - 1) { selected_idx++; force_refresh = 1; } }
-                    if (key == 'k' || key == 'K') { if (selected_idx > 0) { selected_idx--; force_refresh = 1; } }
-                    if (key == 'K') { if (match_count > 0 && filtered_conns[selected_idx]->pid > 0) { kill_confirm = 1; force_refresh = 1; } }
-                    if (key == 10 || key == 13) { 
-                        if (match_count > 0) { show_detail_overlay(filtered_conns[selected_idx]); while(get_key() == -1) usleep(50000); }
+            if (FD_ISSET(STDIN_FILENO, &readfds)) {
+                int key = get_key();
+                if (key != -1) {
+                    if (kill_confirm) {
+                        if (key == 'y' || key == 'Y') {
+                            #ifndef _WIN32
+                            if (match_count > 0 && selected_idx < match_count) {
+                                kill(filtered_conns[selected_idx]->pid, 15);
+                            }
+                            #endif
+                        }
+                        kill_confirm = 0; force_refresh = 1;
+                    } else if (is_searching) {
+                        if (key == 10 || key == 13 || key == 27) is_searching = 0;
+                        else if (key == 8 || key == 127) { int l = strlen(search_filter); if (l > 0) search_filter[l - 1] = '\0'; }
+                        else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { 
+                            int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; 
+                            selected_idx = 0; scroll_offset = 0;
+                        }
                         force_refresh = 1;
+                    } else {
+                        if (key == 'q' || key == 'Q') { set_non_blocking_input(0); printf("\nExiting...\n"); return 0; }
+                        if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; force_refresh = 1; }
+                        if (key == '/') { is_searching = 1; search_filter[0] = '\0'; force_refresh = 1; }
+                        if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); force_refresh = 1; }
+                        if (key == 'j' || key == 'J') { if (selected_idx < match_count - 1) { selected_idx++; force_refresh = 1; } }
+                        if (key == 'k' || key == 'K') { if (selected_idx > 0) { selected_idx--; force_refresh = 1; } }
+                        if (key == 'K') { if (match_count > 0 && filtered_conns[selected_idx]->pid > 0) { kill_confirm = 1; force_refresh = 1; } }
+                        if (key == 10 || key == 13) { 
+                            if (match_count > 0) { show_detail_overlay(filtered_conns[selected_idx]); while(get_key() == -1) usleep(50000); }
+                            force_refresh = 1;
+                        }
+                        if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); selected_idx = 0; scroll_offset = 0; force_refresh = 1; }
                     }
-                    if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); selected_idx = 0; scroll_offset = 0; force_refresh = 1; }
                 }
             }
 
-            // B. 处理内核驱动事件 (Tier 2: Netlink 触发器)
-            if (current_tier == DRIVER_NETLINK && nl_fd != -1) {
+            // B. 处理内核驱动事件
+            if (current_tier == DRIVER_NETLINK && nl_fd != -1 && FD_ISSET(nl_fd, &readfds)) {
                 if (nl_wait_for_event(nl_fd) == 1) {
-                    force_refresh = 1; // 捕获到 exec，立即扫描
+                    force_refresh = 1; 
                 }
             }
 
             if (force_refresh) break;
-            usleep(POLL_INTERVAL_US);
         }
         free(filtered_conns);
     }

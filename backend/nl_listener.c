@@ -54,8 +54,12 @@ int nl_wait_for_event(int nl_sock) {
     char buf[1024];
     struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
     
-    ssize_t len = recv(nl_sock, buf, sizeof(buf), 0);
-    if (len <= 0) return -1;
+    // 使用 MSG_DONTWAIT 确保在 select 之后调用时不会进入死等
+    ssize_t len = recv(nl_sock, buf, sizeof(buf), MSG_DONTWAIT);
+    if (len <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; // 无数据
+        return -1; // 出错
+    }
 
     for (; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len)) {
         if (nlh->nlmsg_type == NLMSG_ERROR) return -1;
