@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/select.h>
+#include <sys/time.h>
 #include <errno.h>
 #endif
 
@@ -83,7 +84,7 @@ void update_ui_text() {
     if (current_lang == LANG_CN) {
         ui_text.title = "NCM 网络连接监测器 v2.0";
         ui_text.ctrl_hint = "按 Q 退出 | L 切换 English | 1-5 切换视图";
-        ui_text.scroll_hint = "J/K 滚动";
+        ui_text.scroll_hint = "J/K/↑/↓ 滚动";
         ui_text.search_hint = "/ 搜索";
         ui_text.sort_hint = "S 排序";
         ui_text.driver_label = "驱动级别";
@@ -108,7 +109,7 @@ void update_ui_text() {
     } else {
         ui_text.title = "NCM - Network Monitor v2.0";
         ui_text.ctrl_hint = "Q:Exit | L:Language | 1-5:Switch View";
-        ui_text.scroll_hint = "J/K:Scroll";
+        ui_text.scroll_hint = "J/K/↑/↓:Scroll";
         ui_text.search_hint = "/:Search";
         ui_text.sort_hint = "S:Sort";
         ui_text.driver_label = "DRIVER";
@@ -145,6 +146,10 @@ const char* trans_status(const char* st) {
 }
 
 // 非阻塞输入处理 (跨平台)
+// 特殊按键定义
+#define KEY_UP    1001
+#define KEY_DOWN  1002
+
 #ifndef _WIN32
 void set_non_blocking_input(int enable) {
     static struct termios oldt, newt;
@@ -160,13 +165,46 @@ void set_non_blocking_input(int enable) {
 }
 int get_key() {
     unsigned char ch;
-    if (read(STDIN_FILENO, &ch, 1) > 0) return (int)ch;
-    return -1;
+    if (read(STDIN_FILENO, &ch, 1) <= 0) return -1;
+    
+    // 处理方向键 (ANSI 转义序列: ESC [ A / ESC [ B)
+    if (ch == 27) {
+        // 设置极短的阻塞等待后续序列，防止序列断裂
+        unsigned char seq[2];
+        int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK); // 临时切回阻塞
+        
+        struct timeval tv = {0, 50000}; // 50ms 超时
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        
+        if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+            if (read(STDIN_FILENO, &seq[0], 1) > 0 && seq[0] == '[') {
+                if (read(STDIN_FILENO, &seq[1], 1) > 0) {
+                    fcntl(STDIN_FILENO, F_SETFL, flags); // 恢复原状态
+                    if (seq[1] == 'A') return KEY_UP;
+                    if (seq[1] == 'B') return KEY_DOWN;
+                }
+            }
+        }
+        fcntl(STDIN_FILENO, F_SETFL, flags); // 恢复原状态
+        return 27;
+    }
+    return (int)ch;
 }
 #else
 void set_non_blocking_input(int enable) { (void)enable; }
 int get_key() {
-    if (_kbhit()) return _getch();
+    if (_kbhit()) {
+        int ch = _getch();
+        if (ch == 0 || ch == 224) { // 方向键扩展码
+            ch = _getch();
+            if (ch == 72) return KEY_UP;
+            if (ch == 80) return KEY_DOWN;
+        }
+        return ch;
+    }
     return -1;
 }
 #endif
@@ -176,6 +214,7 @@ void clear_screen() {
 #ifdef _WIN32
     system("cls");
 #else
+    // 恢复全屏清除模式以消除视图切换时的样式错乱和残影
     printf("\033[2J\033[H");
 #endif
 }
@@ -277,21 +316,48 @@ void draw_sparkline() {
 
 // 显示详情浮窗
 void show_detail_overlay(ConnectionInfo *conn) {
-    printf("\033[H\033[J"); // 清屏
+    printf("\033[2J\033[H"); // 全屏清除，进入详情
     printf("\n\n" CL_BLD "  ┌────────────────────────────────────────────────────────────┐\n");
-    printf("  │ " CL_MAG "PROCESS DETAILS" CLR_RST "                                          │\n");
+    
+    // 标题行
+    printf("  │ " CL_MAG); print_padded("PROCESS DETAILS", 58); printf(CLR_RST " │\n");
     printf("  ├────────────────────────────────────────────────────────────┤\n");
-    printf("  │ " CL_CYN "PID:       " CLR_RST "%-48d │\n", conn->pid);
-    printf("  │ " CL_CYN "COMM:      " CLR_RST "%-48s │\n", conn->process);
-    printf("  │ " CL_CYN "PROTO/ST:  " CLR_RST "%-48s │\n", conn->status);
-    printf("  │ " CL_CYN "LOCAL:     " CLR_RST "%-48s │\n", conn->local_addr);
-    printf("  │ " CL_CYN "REMOTE:    " CLR_RST "%-48s │\n", conn->remote_addr);
-    printf("  │ " CL_CYN "EXE PATH:  " CLR_RST "%-48.48s │\n", conn->exe_path);
-    if (strlen(conn->exe_path) > 48)
-    printf("  │            %-48.48s │\n", conn->exe_path + 48);
-    printf("  │ " CL_RED "RISK:      " CLR_RST "%-48s │\n", strlen(conn->risk_reason) ? conn->risk_reason : "Safe");
+    
+    char buf[64];
+    // PID
+    snprintf(buf, sizeof(buf), "%d", conn->pid);
+    printf("  │ " CL_CYN); print_padded("PID:       ", 11); printf(CLR_RST); print_padded(buf, 47); printf(" │\n");
+    
+    // COMM
+    printf("  │ " CL_CYN); print_padded("COMM:      ", 11); printf(CLR_RST); print_padded(conn->process, 47); printf(" │\n");
+    
+    // PROTO/ST
+    printf("  │ " CL_CYN); print_padded("PROTO/ST:  ", 11); printf(CLR_RST); print_padded(conn->status, 47); printf(" │\n");
+    
+    // LOCAL
+    printf("  │ " CL_CYN); print_padded("LOCAL:     ", 11); printf(CLR_RST); print_padded(conn->local_addr, 47); printf(" │\n");
+    
+    // REMOTE
+    printf("  │ " CL_CYN); print_padded("REMOTE:    ", 11); printf(CLR_RST); print_padded(conn->remote_addr, 47); printf(" │\n");
+    
+    // EXE PATH (处理换行)
+    printf("  │ " CL_CYN); print_padded("EXE PATH:  ", 11); printf(CLR_RST); 
+    if (strlen(conn->exe_path) <= 47) {
+        print_padded(conn->exe_path, 47); printf(" │\n");
+    } else {
+        char path_part[48];
+        strncpy(path_part, conn->exe_path, 47); path_part[47] = '\0';
+        print_padded(path_part, 47); printf(" │\n");
+        printf("  │            "); print_padded(conn->exe_path + 47, 47); printf(" │\n");
+    }
+    
+    // RISK
+    printf("  │ " CL_RED); print_padded("RISK:      ", 11); printf(CLR_RST); 
+    print_padded(strlen(conn->risk_reason) ? conn->risk_reason : "Safe", 47); printf(" │\n");
+    
     printf("  ├────────────────────────────────────────────────────────────┤\n");
-    printf("  │ " CL_YLW "Press ANY KEY to return" CLR_RST "                                  │\n");
+    // 底部提示
+    printf("  │ " CL_YLW); print_padded("Press ANY KEY to return", 58); printf(CLR_RST " │\n");
     printf("  └────────────────────────────────────────────────────────────┘\n");
     fflush(stdout);
 }
@@ -367,32 +433,46 @@ int main(int argc, char **argv) {
     set_non_blocking_input(1);
     memset(history_snapshots, 0, sizeof(history_snapshots));
     
-    int internal_count_cache = 0;
+    int needs_data_scan = 1;
+    time_t last_scan_time = 0;
+    long last_interaction_time = 0; // 毫秒级交互记录
+    ConnectionInfo *conns = NULL;
+    int count = 0;
+    ConnectionStats stats;
+
     while (1) {
         update_ui_text();
-        int count = 0;
-        ConnectionInfo *conns = scanner_get_connections(&count);
         
-        if (!conns && count == 0) {
-            clear_screen();
-            printf(CL_BLD CL_RED "Error: Connection Scan Failed\n" CLR_RST);
-            sleep(1);
-            continue;
-        }
-        
-        push_history(count);
-        ConnectionStats stats;
-        calculate_stats(conns, count, &stats);
-        
-        for (int i = 0; i < count; i++) {
-            is_suspicious(&conns[i]);
-            int cur_proc_conns = 0;
-            if (conns[i].pid > 0) {
-                for(int j=0; j<count; j++) if(conns[j].pid == conns[i].pid) cur_proc_conns++;
-                if (check_frequency_spike(conns[i].pid, cur_proc_conns)) {
-                    strcpy(conns[i].risk_reason, "Spike");
+        struct timeval tv_now;
+        gettimeofday(&tv_now, NULL);
+        long now_ms = tv_now.tv_sec * 1000 + tv_now.tv_usec / 1000;
+        time_t now_sec = tv_now.tv_sec;
+
+        // 策略：如果用户正在操作（过去 500ms 内有按键），推迟扫描
+        // 除非数据已经超过 5 秒没有更新，必须强制刷新
+        int user_is_busy = (now_ms - last_interaction_time < 500);
+        if (now_sec - last_scan_time >= 5) needs_data_scan = 1; // 强迫症更新
+        else if (now_sec - last_scan_time >= 2 && !user_is_busy) needs_data_scan = 1; // 正常定时更新
+
+        if (needs_data_scan) {
+            last_scan_time = now_sec;
+            if (conns) scanner_free_connections(conns, count); 
+            conns = scanner_get_connections(&count);
+            if (!conns && count == 0) {
+                printf(CL_BLD CL_RED "Error: Connection Scan Failed\n" CLR_RST);
+                sleep(1); continue;
+            }
+            push_history(count);
+            calculate_stats(conns, count, &stats);
+            for (int i = 0; i < count; i++) {
+                is_suspicious(&conns[i]);
+                int cur_proc_conns = 0;
+                if (conns[i].pid > 0) {
+                    for(int j=0; j<count; j++) if(conns[j].pid == conns[i].pid) cur_proc_conns++;
+                    if (check_frequency_spike(conns[i].pid, cur_proc_conns)) strcpy(conns[i].risk_reason, "Spike");
                 }
             }
+            needs_data_scan = 0;
         }
 
         if (current_sort != SORT_NONE) sort_connections(conns, count, current_sort);
@@ -442,7 +522,6 @@ int main(int argc, char **argv) {
             }
             if (vm) filtered_conns[match_count++] = &conns[i];
         }
-        internal_count_cache = match_count;
 
         // 滚动与选择自适应
         int display_limit = 15; 
@@ -488,9 +567,12 @@ int main(int argc, char **argv) {
                    filtered_conns[selected_idx]->pid, filtered_conns[selected_idx]->process);
             fflush(stdout);
         }
+        // 渲染完成后清除屏幕剩余部分，确保长列表切短列表时没有残影
+        printf("\033[J");
+        fflush(stdout);
 
         push_snapshot(conns, count);
-        scanner_free_connections(conns, count);
+        // scanner_free_connections(conns, count); // 现在由 data_scan 逻辑控制释放时机
         fflush(stdout);
 
         // 统一输入与驱动事件轮询 (双引擎驱动 - Select 优化版)
@@ -514,12 +596,16 @@ int main(int argc, char **argv) {
             int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
             
             if (activity < 0 && errno != EINTR) break;
-            if (activity == 0) continue; // 超时，无事发生，继续下一次小轮询
+            // 移除 activity == 0 continue，让循环自然流转以维持响应式
 
             // A. 处理用户输入
             if (FD_ISSET(STDIN_FILENO, &readfds)) {
                 int key = get_key();
                 if (key != -1) {
+                    struct timeval tv_int;
+                    gettimeofday(&tv_int, NULL);
+                    last_interaction_time = tv_int.tv_sec * 1000 + tv_int.tv_usec / 1000;
+
                     if (kill_confirm) {
                         if (key == 'y' || key == 'Y') {
                             #ifndef _WIN32
@@ -542,8 +628,8 @@ int main(int argc, char **argv) {
                         if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; force_refresh = 1; }
                         if (key == '/') { is_searching = 1; search_filter[0] = '\0'; force_refresh = 1; }
                         if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); force_refresh = 1; }
-                        if (key == 'j' || key == 'J') { if (selected_idx < match_count - 1) { selected_idx++; force_refresh = 1; } }
-                        if (key == 'k' || key == 'K') { if (selected_idx > 0) { selected_idx--; force_refresh = 1; } }
+                        if (key == 'j' || key == 'J' || key == KEY_DOWN) { if (selected_idx < match_count - 1) { selected_idx++; force_refresh = 1; } }
+                        if (key == 'k' || key == 'K' || key == KEY_UP) { if (selected_idx > 0) { selected_idx--; force_refresh = 1; } }
                         if (key == 'K') { if (match_count > 0 && filtered_conns[selected_idx]->pid > 0) { kill_confirm = 1; force_refresh = 1; } }
                         if (key == 10 || key == 13) { 
                             if (match_count > 0) { show_detail_overlay(filtered_conns[selected_idx]); while(get_key() == -1) usleep(50000); }
@@ -558,6 +644,7 @@ int main(int argc, char **argv) {
             if (current_tier == DRIVER_NETLINK && nl_fd != -1 && FD_ISSET(nl_fd, &readfds)) {
                 if (nl_wait_for_event(nl_fd) == 1) {
                     force_refresh = 1; 
+                    needs_data_scan = 1; // 有新驱动事件，标记需要重扫数据
                 }
             }
 
