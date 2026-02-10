@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <time.h>
 #ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
 #include <conio.h>
 #else
 #include <termios.h>
@@ -407,6 +409,21 @@ void draw_sidebar() {
 }
 
 int main(int argc, char **argv) {
+    #ifdef _WIN32
+    // 设置 Windows 控制台为 UTF-8 编码
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+    
+    // 启用 ANSI 转义序列支持
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD dwMode = 0;
+        if (GetConsoleMode(hOut, &dwMode)) {
+            dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            SetConsoleMode(hOut, dwMode);
+        }
+    }
+    #endif
     // 1. 驱动选择
     current_tier = probe_kernel_features();
     if (current_tier == DRIVER_NETLINK) nl_fd = nl_init_listener();
@@ -435,7 +452,7 @@ int main(int argc, char **argv) {
     
     int needs_data_scan = 1;
     time_t last_scan_time = 0;
-    long last_interaction_time = 0; // 毫秒级交互记录
+    long long last_interaction_time = 0; // 毫秒级交互记录
     ConnectionInfo *conns = NULL;
     int count = 0;
     ConnectionStats stats;
@@ -443,10 +460,25 @@ int main(int argc, char **argv) {
     while (1) {
         update_ui_text();
         
+        long long now_ms;
+        time_t now_sec;
+
+        #ifdef _WIN32
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        unsigned long long tt = ft.dwHighDateTime;
+        tt <<= 32;
+        tt |= ft.dwLowDateTime;
+        tt /= 10000;
+        tt -= 11644473600000ULL;
+        now_ms = (long long)tt;
+        now_sec = (time_t)(tt / 1000);
+        #else
         struct timeval tv_now;
         gettimeofday(&tv_now, NULL);
-        long now_ms = tv_now.tv_sec * 1000 + tv_now.tv_usec / 1000;
-        time_t now_sec = tv_now.tv_sec;
+        now_ms = (long long)tv_now.tv_sec * 1000 + tv_now.tv_usec / 1000;
+        now_sec = tv_now.tv_sec;
+        #endif
 
         // 策略：如果用户正在操作（过去 500ms 内有按键），推迟扫描
         // 除非数据已经超过 5 秒没有更新，必须强制刷新
@@ -577,11 +609,20 @@ int main(int argc, char **argv) {
 
         // 统一输入与驱动事件轮询 (双引擎驱动 - Select 优化版)
         int force_refresh = 0;
-        int max_fd = (nl_fd > STDIN_FILENO) ? nl_fd : STDIN_FILENO;
         
         // 降低轮询强度：将外部 20 次循环改为 1 次阻塞等待
         // 这里的 REFRESH_POLL_ITERATIONS 调整为内部逻辑控制
         for (int i = 0; i < REFRESH_POLL_ITERATIONS; i++) {
+            int key = -1;
+            int has_netlink = 0;
+
+            #ifdef _WIN32
+            Sleep(POLL_INTERVAL_US / 1000);
+            if (_kbhit()) {
+                key = get_key();
+            }
+            #else
+            int max_fd = (nl_fd > STDIN_FILENO) ? nl_fd : STDIN_FILENO;
             fd_set readfds;
             FD_ZERO(&readfds);
             FD_SET(STDIN_FILENO, &readfds);
@@ -596,52 +637,75 @@ int main(int argc, char **argv) {
             int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
             
             if (activity < 0 && errno != EINTR) break;
-            // 移除 activity == 0 continue，让循环自然流转以维持响应式
+            
+            if (activity > 0) {
+                if (FD_ISSET(STDIN_FILENO, &readfds)) {
+                    key = get_key();
+                }
+                if (current_tier == DRIVER_NETLINK && nl_fd != -1 && FD_ISSET(nl_fd, &readfds)) {
+                    has_netlink = 1;
+                }
+            }
+            #endif
 
             // A. 处理用户输入
-            if (FD_ISSET(STDIN_FILENO, &readfds)) {
-                int key = get_key();
-                if (key != -1) {
-                    struct timeval tv_int;
-                    gettimeofday(&tv_int, NULL);
-                    last_interaction_time = tv_int.tv_sec * 1000 + tv_int.tv_usec / 1000;
+            if (key != -1) {
+                #ifdef _WIN32
+                FILETIME ft_int;
+                GetSystemTimeAsFileTime(&ft_int);
+                unsigned long long tt_int = ft_int.dwHighDateTime;
+                tt_int <<= 32;
+                tt_int |= ft_int.dwLowDateTime;
+                tt_int /= 10000;
+                tt_int -= 11644473600000ULL;
+                last_interaction_time = (long long)tt_int;
+                #else
+                struct timeval tv_int;
+                gettimeofday(&tv_int, NULL);
+                last_interaction_time = (long long)tv_int.tv_sec * 1000 + tv_int.tv_usec / 1000;
+                #endif
 
-                    if (kill_confirm) {
-                        if (key == 'y' || key == 'Y') {
-                            #ifndef _WIN32
-                            if (match_count > 0 && selected_idx < match_count) {
-                                kill(filtered_conns[selected_idx]->pid, 15);
-                            }
+                if (kill_confirm) {
+                    if (key == 'y' || key == 'Y') {
+                        #ifndef _WIN32
+                        if (match_count > 0 && selected_idx < match_count) {
+                            kill(filtered_conns[selected_idx]->pid, 15);
+                        }
+                        #endif
+                    }
+                    kill_confirm = 0; force_refresh = 1;
+                } else if (is_searching) {
+                    if (key == 10 || key == 13 || key == 27) is_searching = 0;
+                    else if (key == 8 || key == 127) { int l = strlen(search_filter); if (l > 0) search_filter[l - 1] = '\0'; }
+                    else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { 
+                        int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; 
+                        selected_idx = 0; scroll_offset = 0;
+                    }
+                    force_refresh = 1;
+                } else {
+                    if (key == 'q' || key == 'Q') { set_non_blocking_input(0); printf("\nExiting...\n"); return 0; }
+                    if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; force_refresh = 1; }
+                    if (key == '/') { is_searching = 1; search_filter[0] = '\0'; force_refresh = 1; }
+                    if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); force_refresh = 1; }
+                    if (key == 'j' || key == 'J' || key == KEY_UP) { if (selected_idx < match_count - 1) { selected_idx++; force_refresh = 1; } }
+                    if (key == 'k' || key == 'K' || key == KEY_UP) { if (selected_idx > 0) { selected_idx--; force_refresh = 1; } }
+                    if (key == 'K') { if (match_count > 0 && filtered_conns[selected_idx]->pid > 0) { kill_confirm = 1; force_refresh = 1; } }
+                    if (key == 10 || key == 13) { 
+                        if (match_count > 0) { show_detail_overlay(filtered_conns[selected_idx]); while(get_key() == -1) 
+                            #ifdef _WIN32
+                            Sleep(50);
+                            #else
+                            usleep(50000); 
                             #endif
                         }
-                        kill_confirm = 0; force_refresh = 1;
-                    } else if (is_searching) {
-                        if (key == 10 || key == 13 || key == 27) is_searching = 0;
-                        else if (key == 8 || key == 127) { int l = strlen(search_filter); if (l > 0) search_filter[l - 1] = '\0'; }
-                        else if (key >= 32 && key <= 126 && strlen(search_filter) < 63) { 
-                            int l = strlen(search_filter); search_filter[l] = (char)key; search_filter[l + 1] = '\0'; 
-                            selected_idx = 0; scroll_offset = 0;
-                        }
                         force_refresh = 1;
-                    } else {
-                        if (key == 'q' || key == 'Q') { set_non_blocking_input(0); printf("\nExiting...\n"); return 0; }
-                        if (key == 'l' || key == 'L') { current_lang = (current_lang == LANG_CN) ? LANG_EN : LANG_CN; force_refresh = 1; }
-                        if (key == '/') { is_searching = 1; search_filter[0] = '\0'; force_refresh = 1; }
-                        if (key == 's' || key == 'S') { current_sort = (SortMode)((current_sort + 1) % 4); force_refresh = 1; }
-                        if (key == 'j' || key == 'J' || key == KEY_DOWN) { if (selected_idx < match_count - 1) { selected_idx++; force_refresh = 1; } }
-                        if (key == 'k' || key == 'K' || key == KEY_UP) { if (selected_idx > 0) { selected_idx--; force_refresh = 1; } }
-                        if (key == 'K') { if (match_count > 0 && filtered_conns[selected_idx]->pid > 0) { kill_confirm = 1; force_refresh = 1; } }
-                        if (key == 10 || key == 13) { 
-                            if (match_count > 0) { show_detail_overlay(filtered_conns[selected_idx]); while(get_key() == -1) usleep(50000); }
-                            force_refresh = 1;
-                        }
-                        if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); selected_idx = 0; scroll_offset = 0; force_refresh = 1; }
                     }
+                    if (key >= '1' && key <= '5') { current_view = (ViewType)(key - '0'); selected_idx = 0; scroll_offset = 0; force_refresh = 1; }
                 }
             }
 
             // B. 处理内核驱动事件
-            if (current_tier == DRIVER_NETLINK && nl_fd != -1 && FD_ISSET(nl_fd, &readfds)) {
+            if (has_netlink) {
                 if (nl_wait_for_event(nl_fd) == 1) {
                     force_refresh = 1; 
                     needs_data_scan = 1; // 有新驱动事件，标记需要重扫数据

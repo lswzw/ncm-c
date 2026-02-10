@@ -1,10 +1,20 @@
+#include "backend/kernel_probe.h"
+
+#ifdef _WIN32
+DriverTier probe_kernel_features() {
+    return DRIVER_POLLING;
+}
+
+const char* get_driver_name(DriverTier tier) {
+    return "Standard Polling (Win)";
+}
+#else
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
-#include "backend/kernel_probe.h"
 
 // 简单的内核版本检查
 static int is_kernel_version_ge(int major, int minor) {
@@ -60,3 +70,4 @@ const char* get_driver_name(DriverTier tier) {
         default:             return "Standard Polling (Tier 0)";
     }
 }
+#endif

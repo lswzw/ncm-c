@@ -1,3 +1,9 @@
+#include "backend/nl_listener.h"
+
+#ifdef _WIN32
+int nl_init_listener() { return -1; }
+int nl_wait_for_event(int nl_sock) { return 0; }
+#else
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,7 +13,6 @@
 #include <linux/connector.h>
 #include <linux/cn_proc.h>
 #include <errno.h>
-#include "backend/nl_listener.h"
 
 int nl_init_listener() {
     int nl_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
@@ -74,3 +79,4 @@ int nl_wait_for_event(int nl_sock) {
     }
     return 0;
 }
+#endif
